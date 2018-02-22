@@ -142,7 +142,7 @@ class SetnsContext:
             raise
         return self
 
-    def post_fork(self):
+    def fix_fd_ns(self):
         for new_ns_fd, ns_flag in self.new_fds:
             setns(new_ns_fd, ns_flag)
 
@@ -170,17 +170,68 @@ class ContainerContext:
         return False
 
     def run(self, *args, **kwargs):
+        user = kwargs.pop('user', None)
+        group = kwargs.pop('group', None)
+        post_fork = self.make_post_fork(user=user, group=group)
+
+        env = kwargs.pop('env', {})
+        kwargs['env'] = self.fix_env_var(env, user=user, group=group)
+
         with self.setns_context:
-            return subprocess.run(*args, **kwargs, preexec_fn=self.setns_context.post_fork)
+            return subprocess.run(*args, **kwargs, preexec_fn=post_fork)
 
     def Popen(self, *args, **kwargs):
-        with self.setns_context:
-            return subprocess.Popen(*args, **kwargs, preexec_fn=self.setns_context.post_fork)
+        user = kwargs.pop('user', None)
+        group = kwargs.pop('group', None)
+        post_fork = self.make_post_fork(user=user, group=group)
 
-    def interactive_shell(self, virtual_hostname='container'):
-        print()
+        env = kwargs.pop('env', {})
+        kwargs['env'] = self.fix_env_var(env, user=user, group=group)
+
+        with self.setns_context:
+            return subprocess.Popen(*args, **kwargs, preexec_fn=post_fork)
+
+    def fix_env_var(self, env, user=None, group=None):
+        if user is not None:
+            if user == 'root':
+                env['HOME'] = '/root'
+            else:
+                env['HOME'] = '/home/{}'.format(user)
+        return env
+
+    def make_post_fork(self, user=None, group=None):
+        def fn():
+            self.setns_context.fix_fd_ns()
+
+            if user is not None:
+                if group is None:
+                    self.drop_privileges(user=user, group=user)
+                else:
+                    self.drop_privileges(user=user, group=group)
+        return fn
+
+    def drop_privileges(self, user='nobody', group='nogroup'):
+        import os
+        import pwd
+        import grp
+        if os.getuid() != 0:
+            raise ValueError    # We're not root, something is wrong
+
+        # Get the uid/gid from the name
+        running_uid = pwd.getpwnam(user).pw_uid
+        running_gid = grp.getgrnam(group).gr_gid
+
+        # Remove group privileges
+        os.setgroups([])
+
+        # Try setting the new uid/gid
+        os.setgid(running_gid)
+        os.setuid(running_uid)
+
+    def interactive_shell(self, virtual_hostname='container', user=None):
         self.run(
             ['bash', '--norc', '--noprofile', '-i'],
+            user=user,
             env={
                 'PS1': 'furnace-debug@{} \033[32m\w\033[0m # '.format(virtual_hostname)
             }
