@@ -113,3 +113,6 @@ requirements_installed_with_docker.txt
 # vim
 *.swo
 *.swp
+
+# backup files
+*~
