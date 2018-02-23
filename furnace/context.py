@@ -170,37 +170,40 @@ class ContainerContext:
         return False
 
     def run(self, *args, **kwargs):
-        user = kwargs.pop('user', None)
-        group = kwargs.pop('group', None)
-        post_fork = self.make_post_fork(user=user, group=group)
-
-        env = kwargs.pop('env', {})
-        kwargs['env'] = self.fix_env_var(env, user=user, group=group)
-
+        args, kwargs = self.prepare_fork(*args, **kwargs)
         with self.setns_context:
-            return subprocess.run(*args, **kwargs, preexec_fn=post_fork)
+            return subprocess.run(*args, **kwargs)
 
     def Popen(self, *args, **kwargs):
+        args, kwargs = self.prepare_fork(*args, **kwargs)
+        with self.setns_context:
+            return subprocess.run(*args, **kwargs)
+
+    def prepare_fork(self, *args, **kwargs):
         user = kwargs.pop('user', None)
         group = kwargs.pop('group', None)
-        post_fork = self.make_post_fork(user=user, group=group)
-
+        cwd = kwargs.pop('cwd', None)
         env = kwargs.pop('env', {})
-        kwargs['env'] = self.fix_env_var(env, user=user, group=group)
 
-        with self.setns_context:
-            return subprocess.Popen(*args, **kwargs, preexec_fn=post_fork)
+        # fix environment variables
+        defaultEnv = {
+            'PATH': '/usr/bin:/usr/sbin:/bin/:/sbin',
+            'LANG': 'en_US.utf8',
+            'LC_ALL': 'en_US.utf8',
+            'HOME': '/root'
+        }
+        if env is None:
+            env = {}
+        if user is not None and user != 'root':
+            defaultEnv['HOME'] = '/home/{}'.format(user)
+        for k, v in defaultEnv.items():
+            if k not in env:
+                env[k] = v
+        kwargs['env'] = env
 
-    def fix_env_var(self, env, user=None, group=None):
-        if user is not None:
-            if user == 'root':
-                env['HOME'] = '/root'
-            else:
-                env['HOME'] = '/home/{}'.format(user)
-        return env
-
-    def make_post_fork(self, user=None, group=None):
-        def fn():
+        # after fork, and before handing control to user commnad
+        # we insert a preexec_fn hook
+        def post_fork():
             self.setns_context.fix_fd_ns()
 
             if user is not None:
@@ -208,7 +211,11 @@ class ContainerContext:
                     self.drop_privileges(user=user, group=user)
                 else:
                     self.drop_privileges(user=user, group=group)
-        return fn
+            if cwd is not None:
+                os.chdir(cwd)
+        kwargs['preexec_fn'] = post_fork
+
+        return args, kwargs
 
     def drop_privileges(self, user='nobody', group='nogroup'):
         import os
@@ -228,11 +235,19 @@ class ContainerContext:
         os.setgid(running_gid)
         os.setuid(running_uid)
 
-    def interactive_shell(self, virtual_hostname='container', user=None):
-        self.run(
-            ['bash', '--norc', '--noprofile', '-i'],
-            user=user,
-            env={
-                'PS1': 'furnace-debug@{} \033[32m\w\033[0m # '.format(virtual_hostname)
-            }
-        )
+    def interactive_shell(self, virtual_hostname='container', user=None, env=None, login=True):
+        # login shell?
+        if login:
+            cmd = ['bash', '-i']
+            if user is None:
+                cwd = '/root'
+            else:
+                cwd = '/home/{}'.format(user)
+        else:
+            cmd = ['bash', '--noprofile', '--norc', '-i']
+            cwd = '/'
+            if env is None:
+                env = {}
+            env['PS1'] = 'furnace-debug@{} \033[32m\w\033[0m # '.format(virtual_hostname)
+
+        self.run(cmd, user=user, env=env, cwd=cwd)
