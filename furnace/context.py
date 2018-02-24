@@ -159,6 +159,9 @@ class ContainerContext:
         self.pid1 = ContainerPID1Manager(root_dir, isolate_networking=isolate_networking)
         self.setns_context = None
 
+        self.default_user = None
+        self.default_group = None
+
     def __enter__(self):
         self.pid1.start()
         self.setns_context = SetnsContext(self.pid1.pid)
@@ -168,6 +171,10 @@ class ContainerContext:
         self.setns_context = None
         self.pid1.kill()
         return False
+
+    def set_user(self, user, group=None):
+        self.default_user = user
+        self.default_group = group
 
     def run(self, *args, **kwargs):
         args, kwargs = self.prepare_fork(*args, **kwargs)
@@ -179,9 +186,35 @@ class ContainerContext:
         with self.setns_context:
             return subprocess.run(*args, **kwargs)
 
+    def call(self, fun, *args, **kwargs):
+        args, kwargs = self.prepare_fork(*args, **kwargs)
+
+        with self.setns_context:
+            preexec_fn = kwargs['preexec_fn']
+
+            child_pid = os.fork()
+            if child_pid == 0:
+                # call fun() in child process
+                preexec_fn()
+                rc = fun()
+
+                if rc is None:
+                    rc = 0 # fun() didn't return anything
+                else:
+                    try:
+                        rc = int(rc)
+                    except:
+                        rc = 0
+                os._exit(rc)
+
+            # parent wait for child to complete
+            pid, retcode = os.waitpid(child_pid, 0)
+
+        return retcode
+
     def prepare_fork(self, *args, **kwargs):
-        user = kwargs.pop('user', None)
-        group = kwargs.pop('group', None)
+        user = kwargs.pop('user', self.default_user)
+        group = kwargs.pop('group', self.default_group)
         cwd = kwargs.pop('cwd', None)
         env = kwargs.pop('env', {})
 
@@ -235,7 +268,10 @@ class ContainerContext:
         os.setgid(running_gid)
         os.setuid(running_uid)
 
-    def interactive_shell(self, virtual_hostname='container', user=None, env=None, login=True):
+    def interactive_shell(self, virtual_hostname='container', login=True, **kwargs):
+        user = kwargs.pop('user', self.default_user)
+        env = kwargs.pop('env', None)
+
         # login shell?
         if login:
             cmd = ['bash', '-i']
@@ -247,7 +283,8 @@ class ContainerContext:
             cmd = ['bash', '--noprofile', '--norc', '-i']
             cwd = '/'
             if env is None:
-                env = {}
-            env['PS1'] = 'furnace-debug@{} \033[32m\w\033[0m # '.format(virtual_hostname)
+                env = {
+                    'PS1': 'furnace-debug@{} \033[32m\w\033[0m # '.format(virtual_hostname),
+                }
 
         self.run(cmd, user=user, env=env, cwd=cwd)
